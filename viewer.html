@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Interactive Raga UMAP</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <style>
+        body {
+            font-family: sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: #111;
+            color: #eee;
+        }
+
+        #plot {
+            width: 100%;
+            height: 80vh;
+        }
+
+        #player-container {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            background: #222;
+            padding: 15px;
+            border-top: 1px solid #444;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        #info {
+            margin-left: 20px;
+            font-size: 1.1em;
+        }
+
+        label {
+            margin-right: 10px;
+            color: #aaa;
+        }
+    </style>
+</head>
+
+<body>
+
+    <h1>Interactive Raga Explorer</h1>
+    <div>
+        <label>Color By:
+            <select id="colorSelect" onchange="renderPlot()">
+                <option value="raga">Raga</option>
+                <option value="janya_number">Janya Number</option>
+            </select>
+        </label>
+        <span id="loading">Loading data...</span>
+    </div>
+
+    <div id="plot"></div>
+
+    <div id="player-container">
+        <div id="info">Click a point to play...</div>
+        <audio id="audio" controls style="width: 50%"></audio>
+    </div>
+
+    <script>
+        let DATA = [];
+        const audio = document.getElementById('audio');
+        const info = document.getElementById('info');
+        const colorSelect = document.getElementById('colorSelect');
+
+        // Load JSON data from URL param or default
+        const urlParams = new URLSearchParams(window.location.search);
+        const jsonPath = urlParams.get('file') || 'data/plots/umap_interactive.json';
+
+        console.log("Loading data from:", jsonPath);
+
+        fetch(jsonPath)
+            .then(r => {
+                if (!r.ok) throw new Error("File not found: " + jsonPath);
+                return r.json();
+            })
+            .then(data => {
+                DATA = data;
+                document.getElementById('loading').style.display = 'none';
+                renderPlot();
+            })
+            .catch(e => {
+                document.getElementById('loading').innerHTML = `Error loading data from <code>${jsonPath}</code>.<br>Make sure to pass ?file=path/to/json in URL.`;
+                console.error(e);
+            });
+
+        function renderPlot() {
+            if (!DATA.length) return;
+
+            const colorField = colorSelect.value;
+
+            // Group by color field
+            const traces = {};
+            DATA.forEach(d => {
+                const group = d[colorField] || "Unknown";
+                if (!traces[group]) {
+                    traces[group] = {
+                        x: [], y: [], text: [],
+                        customdata: [],
+                        mode: 'markers',
+                        type: 'scattergl', // WebGL for performance
+                        name: group,
+                        marker: { size: 6, opacity: 0.7 }
+                    };
+                }
+                traces[group].x.push(d.x);
+                traces[group].y.push(d.y);
+                traces[group].text.push(`${d.song_name} (${d.raga})`);
+                traces[group].customdata.push(d); // Store full object
+            });
+
+            const layout = {
+                title: 'Raga Embeddings (Click to Play)',
+                paper_bgcolor: '#111',
+                plot_bgcolor: '#111',
+                font: { color: '#eee' },
+                hovermode: 'closest',
+                xaxis: { showgrid: false, zeroline: false },
+                yaxis: { showgrid: false, zeroline: false }
+            };
+
+            Plotly.newPlot('plot', Object.values(traces), layout);
+
+            const plotDiv = document.getElementById('plot');
+            plotDiv.on('plotly_click', function (data) {
+                const point = data.points[0];
+                const item = point.customdata;
+                playAudio(item);
+            });
+        }
+
+        function playAudio(item) {
+            info.innerHTML = `<strong>${item.song_name}</strong> - ${item.raga}`;
+
+            // Audio path: "data/raw/..."
+            // We append #t=start,end for media fragments (supported by some browsers)
+            // Or handle manually via timeupdate
+
+            audio.src = item.audio_path;
+
+            // Clean up previous listeners if any (though currently we define inline)
+            // Ideally we use a named function but for valid replacement let's just use the on-property for simplicity
+            // or use { once: true } listener.
+
+            const onLoaded = () => {
+                audio.currentTime = item.start_sec;
+                audio.play().catch(e => console.error("Playback failed:", e));
+            };
+
+            // Use 'one-time' listener to avoid stacking up if playAudio is called multiple times
+            audio.addEventListener('loadedmetadata', onLoaded, { once: true });
+        }
+    </script>
+</body>
+
+</html>
