@@ -2,6 +2,16 @@
 
 Exploring raga classification using audio foundation models (MERT, CultureMERT, CLAP). Audio segments are embedded into a high-dimensional feature space and visualized with UMAP, with clustering quality scored by silhouette, Davies-Bouldin, and Calinski-Harabasz metrics.
 
+## Results
+Silhouette scores evaluated at layer 12 of each model on ~720 segments from the Carnatic Songs Database:
+
+| Label | MERT | CultureMERT |
+|---|---|---|
+| Raga | -0.425 | **-0.389** |
+| Janya number | -0.387 | **-0.329** |
+
+Negative silhouette scores indicate that raga clusters overlap heavily in the UMAP embedding space at this layer — neither model produces clearly separable raga clusters at layer 12. CultureMERT shows a marginal edge. Further analysis across layers (e.g. `cache_all_layers` task) may reveal better-separating representations.
+
 ## Motivation
 
 Ragas are the fundamental melodic frameworks of Indian classical music. Automatically identifying them from audio is a hard problem: ragas share many notes and ornaments, and recordings vary enormously in duration and style. Large self-supervised audio models pre-trained on diverse music offer strong priors that may generalize to this domain without requiring large labeled datasets.
@@ -78,7 +88,7 @@ The dashboard lets you explore UMAP plots and listen to audio clips by clicking 
 ### 1. Start the server
 
 ```bash
-uv run python server.py
+uv run server.py
 ```
 
 Then open **http://localhost:8000** in your browser.
