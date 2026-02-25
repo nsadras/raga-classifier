@@ -12,6 +12,8 @@ from torch.utils.data import Dataset
 import torchaudio.transforms as T
 from tqdm import tqdm
 
+from preprocessing import compute_melodic_score
+
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +72,7 @@ def download_youtube_audio(
     out_wav_path: Path,
     cookies_from_browser: Optional[str] = None,
     browser_profile: Optional[str] = None,
+    cookies_file: Optional[str] = None,
 ) -> Tuple[bool, Optional[str]]:
     """
     Download YouTube audio and convert to mono wav using ffmpeg via yt-dlp.
@@ -96,12 +99,17 @@ def download_youtube_audio(
         ],
         # Enforce mono during conversion
         "postprocessor_args": ["-ac", "1"],
-        "quiet": True,
-        "noprogress": True,
-        "ignoreerrors": True,
+        "quiet": False,
+        "noprogress": False,
+        "ignoreerrors": False,
+        "noplaylist": True,
         "retries": 3,
     }
-    if cookies_from_browser:
+       
+    if cookies_file:
+        ydl_opts["cookiefile"] = cookies_file
+        logger.info(f"Using cookies from file '{cookies_file}'")
+    elif cookies_from_browser:
         # Use cookies from a local browser to bypass consent/age walls
         if browser_profile:
             ydl_opts["cookiesfrombrowser"] = (cookies_from_browser, browser_profile)
@@ -137,6 +145,7 @@ def download_audio_for_manifest(
     max_per_raga: Optional[int] = None,
     cookies_from_browser: Optional[str] = None,
     browser_profile: Optional[str] = None,
+    cookies_file: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Iterate over manifest and download audio if missing. Respects max_per_raga if provided.
@@ -178,6 +187,7 @@ def download_audio_for_manifest(
             out_path,
             cookies_from_browser=cookies_from_browser,
             browser_profile=browser_profile,
+            cookies_file=cookies_file,
         )
         rows.append({**row, "local_path": str(out_path) if ok else None, "dl_ok": ok, "dl_error": err})
         if ok:
@@ -194,8 +204,20 @@ def download_audio_for_manifest(
     return new_df
 
 
-def _load_wav_mono(path: str) -> Tuple[torch.Tensor, int]:
-    data, sr = sf.read(path, always_2d=False)
+def _load_wav_segment(path: str, start_sec: float, end_sec: float) -> Tuple[torch.Tensor, int]:
+    info = sf.info(path)
+    sr = info.samplerate
+    start_frame = int(start_sec * sr)
+    # Ensure end_frame does not exceed total frames
+    end_frame = min(int(end_sec * sr), info.frames)
+    
+    # Calculate frames to read
+    frames_to_read = end_frame - start_frame
+    if frames_to_read <= 0:
+         return torch.zeros(0), sr
+         
+    data, _ = sf.read(path, start=start_frame, stop=end_frame, always_2d=False)
+    
     if data.ndim == 2:
         data = data.mean(axis=1)
     if data.dtype != np.float32:
@@ -212,46 +234,138 @@ class MertAudioDataset(Dataset):
         target_sample_rate: int,
         segment_seconds: float = 20.0,
         segment_hop_seconds: float = 10.0,
+        strategy: str = "simple",  # "simple" or "smart"
+        min_melodic_score: float = -np.inf,
+        max_segments_per_file: Optional[int] = None,
+        index_cache_path: Optional[Path] = None,
     ) -> None:
         self.manifest = manifest.copy()
         self.audio_root = Path(audio_root)
         self.target_sample_rate = int(target_sample_rate)
         self.segment_seconds = float(segment_seconds)
         self.segment_hop_seconds = float(segment_hop_seconds)
+        self.strategy = strategy
+        self.min_melodic_score = min_melodic_score
+        self.max_segments_per_file = max_segments_per_file
+        self.index_cache_path = Path(index_cache_path) if index_cache_path else None
 
         self.index: List[Tuple[int, float, float]] = []  # (row_idx, start_sec, end_sec)
+        self.resamplers = {}
         self._build_index()
 
     def _build_index(self) -> None:
+        import pickle
+        if self.index_cache_path and self.index_cache_path.exists():
+            logger.info(f"Loading dataset index from {self.index_cache_path}")
+            try:
+                with open(self.index_cache_path, 'rb') as f:
+                    cached_data = pickle.load(f)
+                    # Verify config matches
+                    if cached_data.get('strategy') == self.strategy and \
+                       cached_data.get('min_melodic_score') == self.min_melodic_score and \
+                       cached_data.get('segment_seconds') == self.segment_seconds and \
+                       cached_data.get('segment_hop_seconds') == self.segment_hop_seconds: # Corrected key
+                        self.index = cached_data['index']
+                        logger.info(f"Loaded {len(self.index)} segments from cache.")
+                        return
+                    else:
+                        logger.warning("Cached index config mismatch, rebuilding...")
+            except Exception as e:
+                logger.warning(f"Failed to load cached index: {e}")
+
         files = 0
-        for i, row in self.manifest.iterrows():
+        for i, row in tqdm(self.manifest.iterrows(), total=len(self.manifest), desc="Building dataset index"):
             local_path = row.get("local_path")
             dl_ok = row.get("dl_ok", False)
             if not dl_ok or not isinstance(local_path, str) or not Path(local_path).exists():
                 continue
             files += 1
-            # Probe duration via soundfile; avoid loading here by reading header
+            
+            # Load full waveform if smart strategy is needed, otherwise just probe duration
             try:
-                with sf.SoundFile(local_path) as f:
-                    duration_sec = len(f) / f.samplerate
-            except Exception:
+                if self.strategy == "smart":
+                    # We need the waveform to score segments. 
+                    # Use _load_wav_segment(..., 0, None) -> no, helper expects end_sec.
+                    # Helper above computes frames if we give seconds?
+                    # For full file reading in smart mode, we have to read all.
+                    # Reimplement efficient full read here or use helper with large duration?
+                    # Use sf.read directly for full file here.
+                    full_wav_np, sr = sf.read(local_path, always_2d=False)
+                    if full_wav_np.ndim == 2: full_wav_np = full_wav_np.mean(axis=1)
+                    if full_wav_np.dtype != np.float32: full_wav_np = full_wav_np.astype(np.float32)
+                    full_wav = torch.from_numpy(full_wav_np)
+                    duration_sec = full_wav.shape[0] / sr
+                else:
+                    with sf.SoundFile(local_path) as f:
+                        duration_sec = len(f) / f.samplerate
+            except Exception as e:
+                logger.warning(f"Error reading {local_path}: {e}")
                 continue
 
             seg_len = self.segment_seconds
             hop = self.segment_hop_seconds
+            
+            candidates = []
             if duration_sec < max(seg_len, 1.0):
-                # Take a single segment covering available audio
-                self.index.append((i, 0.0, min(duration_sec, seg_len)))
-                continue
+                candidates.append((0.0, min(duration_sec, seg_len)))
+            else:
+                start = 0.0
+                while start + 1e-6 < duration_sec:
+                    end = min(start + seg_len, duration_sec)
+                    candidates.append((start, end))
+                    if end >= duration_sec:
+                        break
+                    start += hop
+            
+            # Filter/Select candidates
+            selected = []
+            if self.strategy == "smart":
+                scored_candidates = []
+                for start, end in candidates:
+                    s_idx = int(start * sr)
+                    e_idx = int(end * sr)
+                    # Use full_wav from memory
+                    segment_wav = full_wav[s_idx:e_idx].numpy()
+                    score = compute_melodic_score(segment_wav, sr)
+                    if score >= self.min_melodic_score:
+                        scored_candidates.append((score, start, end))
+                
+                # Sort by score descending
+                scored_candidates.sort(key=lambda x: x[0], reverse=True)
+                
+                # Take top N
+                if self.max_segments_per_file:
+                    scored_candidates = scored_candidates[:self.max_segments_per_file]
+                
+                selected = [(s, e) for _, s, e in scored_candidates]
+            else:
+                # Simple strategy
+                if self.max_segments_per_file:
+                    selected = candidates[:self.max_segments_per_file]
+                else:
+                    selected = candidates
 
-            start = 0.0
-            while start + 1e-6 < duration_sec:
-                end = min(start + seg_len, duration_sec)
+            for start, end in selected:
                 self.index.append((i, start, end))
-                if end >= duration_sec:
-                    break
-                start += hop
-        logger.info(f"Dataset index built: {files} files, {len(self.index)} segments")
+
+        logger.info(f"Dataset index built: {files} files, {len(self.index)} segments (strategy={self.strategy})")
+        
+        # Save cache if path provided
+        if self.index_cache_path:
+            import pickle
+            try:
+                cache_data = {
+                    'strategy': self.strategy,
+                    'min_melodic_score': self.min_melodic_score,
+                    'segment_seconds': self.segment_seconds,
+                    'segment_hop_seconds': self.segment_hop_seconds,
+                    'index': self.index
+                }
+                with open(self.index_cache_path, 'wb') as f:
+                    pickle.dump(cache_data, f)
+                logger.info(f"Saved dataset index cache to {self.index_cache_path}")
+            except Exception as e:
+                logger.warning(f"Failed to save index cache: {e}")
 
     def __len__(self) -> int:
         return len(self.index)
@@ -260,18 +374,19 @@ class MertAudioDataset(Dataset):
         row_idx, start_sec, end_sec = self.index[idx]
         row = self.manifest.iloc[row_idx]
         path = row["local_path"]
-        waveform, sr = _load_wav_mono(path)
+        
+        # Optimized load: read ONLY the segment from disk
+        waveform, sr = _load_wav_segment(path, start_sec, end_sec)
 
-        # Trim to segment
-        s = int(start_sec * sr)
-        e = int(end_sec * sr)
-        e = min(e, waveform.shape[0])
-        segment = waveform[s:e]
+        if waveform.numel() == 0:
+             logger.warning(f"Loaded empty waveform for {path} (start={start_sec}, end={end_sec}). Skipping.")
+             return None
 
         # Resample if needed
         if sr != self.target_sample_rate:
-            resampler = T.Resample(sr, self.target_sample_rate)
-            segment = resampler(segment.unsqueeze(0)).squeeze(0)
+            if sr not in self.resamplers:
+                self.resamplers[sr] = T.Resample(sr, self.target_sample_rate)
+            waveform = self.resamplers[sr](waveform.unsqueeze(0)).squeeze(0)
 
         info = {
             "song_name": row.get("song_name"),
@@ -281,7 +396,8 @@ class MertAudioDataset(Dataset):
             "start_sec": float(start_sec),
             "end_sec": float(end_sec),
             "sampling_rate": int(self.target_sample_rate),
+            "local_path": str(path),
         }
-        return segment, info
+        return waveform, info
 
 

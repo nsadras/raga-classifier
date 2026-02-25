@@ -1,0 +1,24 @@
+[project]
+name = "raga-classifier"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "datasets>=4.0.0",
+    "librosa>=0.11.0",
+    "numpy>=2.3.2",
+    "pandas>=2.3.2",
+    "plotly>=6.3.0",
+    "protobuf>=6.33.4",
+    "rangehttpserver>=1.4.0",
+    "scikit-learn>=1.7.1",
+    "soundfile>=0.13.1",
+    "torch>=2.8.0",
+    "torchaudio>=2.8.0",
+    "torchvision>=0.23.0",
+    "tqdm>=4.67.1",
+    "transformers>=4.56.0",
+    "umap-learn>=0.5.11",
+    "yt-dlp>=2025.8.27",
+]
