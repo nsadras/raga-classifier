@@ -1,5 +1,7 @@
 # Raga Classifier
 
+![UMAP projection of CultureMERT audio embeddings for ~720 Carnatic music segments, colored by janya (parent scale). Each point is a 30-second clip; nearby points sound similar to the model.](results/culturemert-janya-2026-01-21.png)
+
 Exploring raga classification using audio foundation models (MERT, CultureMERT, CLAP). Audio segments are embedded into a high-dimensional feature space and visualized with UMAP, with clustering quality scored by silhouette, Davies-Bouldin, and Calinski-Harabasz metrics.
 
 ## Motivation
